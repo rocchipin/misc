@@ -1,0 +1,44 @@
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
+
+import java.time.Duration;
+import java.util.concurrent.*;
+
+public class RetryExampleWithExecutor {
+
+    public static void main(String[] args) {
+        // Configuration du retry
+        RetryConfig config = RetryConfig.custom()
+                .maxAttempts(3) // Nombre maximum de tentatives
+                .waitDuration(Duration.ofMillis(500)) // Délai entre les tentatives
+                .build();
+
+        // Création d'un Retry avec la configuration spécifiée
+        Retry retry = Retry.of("retryExample", config);
+
+        // Création d'un ExecutorService
+        ExecutorService executorService = Executors.newSingleThreadExecutor();
+
+        // Création d'un Callable qui simule une opération pouvant échouer
+        Callable<String> callable = () -> {
+            System.out.println("Tentative de l'opération...");
+            if (Math.random() < 0.5) {
+                throw new RuntimeException("Échec de l'opération");
+            }
+            return "Opération réussie!";
+        };
+
+        // Exécution du Callable avec le Retry à travers l'ExecutorService
+        Future<String> future = executorService.submit(() -> retry.executeCallable(callable));
+
+        try {
+            String result = future.get();
+            System.out.println("Résultat : " + result);
+        } catch (InterruptedException | ExecutionException e) {
+            System.out.println("Toutes les tentatives ont échoué : " + e.getCause().getMessage());
+        }
+
+        // Arrêt de l'ExecutorService
+        executorService.shutdown();
+    }
+}
