@@ -1,0 +1,9 @@
+@Configuration
+public class ProxyRouter {
+
+    @Bean
+    public RouterFunction<ServerResponse> routes(ProxyHandler handler) {
+        return RouterFunctions
+                .route(RequestPredicates.GET("/proxy"), handler::handleRequest);
+    }
+}
