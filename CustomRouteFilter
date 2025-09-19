@@ -1,86 +1,133 @@
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.xml.XmlMapper;
+import org.springframework.cloud.gateway.filter.GatewayFilter;
+import org.springframework.cloud.gateway.filter.factory.AbstractGatewayFilterFactory;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.MediaType;
+import org.springframework.http.server.reactive.ServerHttpResponse;
+import org.springframework.stereotype.Component;
+import org.springframework.web.reactive.function.client.ClientResponse;
+import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.server.ServerWebExchange;
+import reactor.core.publisher.Mono;
+
+import java.nio.charset.StandardCharsets;
+
 @Component
-public class CustomRouteFilter implements GatewayFilter, Ordered {
+public class CustomRouteFilter extends AbstractGatewayFilterFactory<CustomRouteFilter.Config> {
 
-    private final WebClient backend1Client; // configuré MTLS
+    private final WebClient backend1Client;
     private final WebClient backend2Client;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final XmlMapper xmlMapper = new XmlMapper();
 
-    @Value("${app.backend2.url}")
-    private String backend2Url;
-
-    public CustomRouteFilter(WebClient backend1Client, WebClient.Builder webClientBuilder) {
+    public CustomRouteFilter(WebClient backend1Client, WebClient backend2Client) {
+        super(Config.class);
         this.backend1Client = backend1Client;
-        this.backend2Client = webClientBuilder.build();
+        this.backend2Client = backend2Client;
     }
 
     @Override
-    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
-        ServerHttpResponse response = exchange.getResponse();
-        DataBufferFactory bufferFactory = response.bufferFactory();
+    public GatewayFilter apply(Config config) {
+        return (exchange, chain) -> {
+            // 👉 Ici, on ne délègue PAS à chain.filter(exchange)
+            // car on veut contrôler la logique de routage entièrement
 
-        // Construire la requête vers backend1 (ajout headers / query params)
-        String urlBackend1 = buildBackend1Url(exchange.getRequest());
+            return callBackend1(exchange, config)
+                    .flatMap(clientResponse -> {
+                        HttpStatus status = clientResponse.statusCode();
+                        if (status != null && status.is2xxSuccessful()) {
+                            // ✅ Backend1 OK : transformer JSON -> XML
+                            return handleBackend1Success(exchange, clientResponse);
+                        } else {
+                            // ❌ Sinon : fallback sur Backend2
+                            return callBackend2(exchange, config)
+                                    .flatMap(resp2 -> forwardResponse(exchange, resp2));
+                        }
+                    });
+        };
+    }
 
+    // --- BACKEND1 ---
+    private Mono<ClientResponse> callBackend1(ServerWebExchange exchange, Config config) {
         return backend1Client.get()
-                .uri(urlBackend1)
-                .headers(h -> mapHeadersForBackend1(exchange.getRequest(), h))
-                .exchangeToMono(clientResponse -> {
-                    HttpStatus status = clientResponse.statusCode();
+                .uri(config.getBackend1Path())
+                .headers(h -> mapHeadersForBackend1(exchange, h))
+                .exchangeToMono(Mono::just);
+    }
 
-                    if (status.is2xxSuccessful()) {
-                        // Lire body JSON de backend1 et transformer en XML
-                        return clientResponse.bodyToMono(String.class)
-                                .flatMap(jsonBody -> {
-                                    String xmlBody = transformJsonToXml(jsonBody);
-                                    byte[] bytes = xmlBody.getBytes(StandardCharsets.UTF_8);
-                                    response.setStatusCode(HttpStatus.OK);
-                                    response.getHeaders().setContentType(MediaType.APPLICATION_XML);
-                                    response.getHeaders().setContentLength(bytes.length);
-                                    DataBuffer buffer = bufferFactory.wrap(bytes);
-                                    return response.writeWith(Mono.just(buffer));
-                                });
-                    } else {
-                        // fallback backend2
-                        String urlBackend2 = buildBackend2Url(exchange.getRequest());
-                        return backend2Client.get()
-                                .uri(urlBackend2)
-                                .headers(h -> mapHeadersForBackend2(exchange.getRequest(), h))
-                                .exchangeToMono(backend2Response -> {
-                                    response.setStatusCode(backend2Response.statusCode());
-                                    response.getHeaders().putAll(backend2Response.headers().asHttpHeaders());
-                                    return response.writeWith(
-                                            backend2Response.bodyToFlux(DataBuffer.class)
-                                                    .map(db -> bufferFactory.wrap(db.asByteBuffer()))
-                                    );
-                                });
+    private Mono<Void> handleBackend1Success(ServerWebExchange exchange, ClientResponse clientResponse) {
+        ServerHttpResponse response = exchange.getResponse();
+        return clientResponse.bodyToMono(String.class)
+                .flatMap(json -> {
+                    try {
+                        JsonNode node = objectMapper.readTree(json);
+                        String xml = xmlMapper.writeValueAsString(node);
+                        byte[] bytes = xml.getBytes(StandardCharsets.UTF_8);
+
+                        response.setStatusCode(HttpStatus.OK);
+                        response.getHeaders().setContentType(MediaType.APPLICATION_XML);
+                        response.getHeaders().setContentLength(bytes.length);
+
+                        return response.writeWith(Mono.just(response.bufferFactory().wrap(bytes)));
+                    } catch (Exception e) {
+                        response.setStatusCode(HttpStatus.INTERNAL_SERVER_ERROR);
+                        return response.setComplete();
                     }
                 });
     }
 
-    @Override
-    public int getOrder() {
-        return -2; // exécuter tôt
+    // --- BACKEND2 ---
+    private Mono<ClientResponse> callBackend2(ServerWebExchange exchange, Config config) {
+        return backend2Client.get()
+                .uri(config.getBackend2Path())
+                .headers(h -> mapHeadersForBackend2(exchange, h))
+                .exchangeToMono(Mono::just);
     }
 
-    private String buildBackend1Url(ServerHttpRequest request) {
-        // TODO : transformer query params selon la logique backend1
-        return "https://backend1/api";
+    private Mono<Void> forwardResponse(ServerWebExchange exchange, ClientResponse clientResponse) {
+        ServerHttpResponse response = exchange.getResponse();
+        response.setStatusCode(clientResponse.statusCode());
+        response.getHeaders().putAll(clientResponse.headers().asHttpHeaders());
+
+        return response.writeWith(
+                clientResponse.bodyToFlux(org.springframework.core.io.buffer.DataBuffer.class)
+                        .map(db -> response.bufferFactory().wrap(db.asByteBuffer()))
+        );
     }
 
-    private String buildBackend2Url(ServerHttpRequest request) {
-        // TODO : transformer query params selon la logique backend2
-        return backend2Url;
+    // --- HEADERS ---
+    private void mapHeadersForBackend1(ServerWebExchange exchange, HttpHeaders headers) {
+        headers.addAll(exchange.getRequest().getHeaders());
+        // TODO: mapping spécifique pour backend1
     }
 
-    private void mapHeadersForBackend1(ServerHttpRequest original, HttpHeaders headers) {
-        // TODO : mapping spécifique
+    private void mapHeadersForBackend2(ServerWebExchange exchange, HttpHeaders headers) {
+        headers.addAll(exchange.getRequest().getHeaders());
+        // TODO: mapping spécifique pour backend2
     }
 
-    private void mapHeadersForBackend2(ServerHttpRequest original, HttpHeaders headers) {
-        // TODO : mapping spécifique
-    }
+    // --- CONFIG ---
+    public static class Config {
+        private String backend1Path;
+        private String backend2Path;
 
-    private String transformJsonToXml(String jsonBody) {
-        // TODO : utiliser Jackson, org.json, ou autre lib
-        return "<response>Hello</response>";
+        public String getBackend1Path() {
+            return backend1Path;
+        }
+
+        public void setBackend1Path(String backend1Path) {
+            this.backend1Path = backend1Path;
+        }
+
+        public String getBackend2Path() {
+            return backend2Path;
+        }
+
+        public void setBackend2Path(String backend2Path) {
+            this.backend2Path = backend2Path;
+        }
     }
 }
