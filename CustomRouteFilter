@@ -1,0 +1,86 @@
+@Component
+public class CustomRouteFilter implements GatewayFilter, Ordered {
+
+    private final WebClient backend1Client; // configuré MTLS
+    private final WebClient backend2Client;
+
+    @Value("${app.backend2.url}")
+    private String backend2Url;
+
+    public CustomRouteFilter(WebClient backend1Client, WebClient.Builder webClientBuilder) {
+        this.backend1Client = backend1Client;
+        this.backend2Client = webClientBuilder.build();
+    }
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        ServerHttpResponse response = exchange.getResponse();
+        DataBufferFactory bufferFactory = response.bufferFactory();
+
+        // Construire la requête vers backend1 (ajout headers / query params)
+        String urlBackend1 = buildBackend1Url(exchange.getRequest());
+
+        return backend1Client.get()
+                .uri(urlBackend1)
+                .headers(h -> mapHeadersForBackend1(exchange.getRequest(), h))
+                .exchangeToMono(clientResponse -> {
+                    HttpStatus status = clientResponse.statusCode();
+
+                    if (status.is2xxSuccessful()) {
+                        // Lire body JSON de backend1 et transformer en XML
+                        return clientResponse.bodyToMono(String.class)
+                                .flatMap(jsonBody -> {
+                                    String xmlBody = transformJsonToXml(jsonBody);
+                                    byte[] bytes = xmlBody.getBytes(StandardCharsets.UTF_8);
+                                    response.setStatusCode(HttpStatus.OK);
+                                    response.getHeaders().setContentType(MediaType.APPLICATION_XML);
+                                    response.getHeaders().setContentLength(bytes.length);
+                                    DataBuffer buffer = bufferFactory.wrap(bytes);
+                                    return response.writeWith(Mono.just(buffer));
+                                });
+                    } else {
+                        // fallback backend2
+                        String urlBackend2 = buildBackend2Url(exchange.getRequest());
+                        return backend2Client.get()
+                                .uri(urlBackend2)
+                                .headers(h -> mapHeadersForBackend2(exchange.getRequest(), h))
+                                .exchangeToMono(backend2Response -> {
+                                    response.setStatusCode(backend2Response.statusCode());
+                                    response.getHeaders().putAll(backend2Response.headers().asHttpHeaders());
+                                    return response.writeWith(
+                                            backend2Response.bodyToFlux(DataBuffer.class)
+                                                    .map(db -> bufferFactory.wrap(db.asByteBuffer()))
+                                    );
+                                });
+                    }
+                });
+    }
+
+    @Override
+    public int getOrder() {
+        return -2; // exécuter tôt
+    }
+
+    private String buildBackend1Url(ServerHttpRequest request) {
+        // TODO : transformer query params selon la logique backend1
+        return "https://backend1/api";
+    }
+
+    private String buildBackend2Url(ServerHttpRequest request) {
+        // TODO : transformer query params selon la logique backend2
+        return backend2Url;
+    }
+
+    private void mapHeadersForBackend1(ServerHttpRequest original, HttpHeaders headers) {
+        // TODO : mapping spécifique
+    }
+
+    private void mapHeadersForBackend2(ServerHttpRequest original, HttpHeaders headers) {
+        // TODO : mapping spécifique
+    }
+
+    private String transformJsonToXml(String jsonBody) {
+        // TODO : utiliser Jackson, org.json, ou autre lib
+        return "<response>Hello</response>";
+    }
+}
