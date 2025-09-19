@@ -1,0 +1,29 @@
+@Configuration
+public class WebClientConfig {
+
+    @Value("${app.backend1.url}")
+    private String backend1Url;
+
+    @Value("${app.backend2.url}")
+    private String backend2Url;
+
+    @Bean
+    public WebClient backend1Client() throws Exception {
+        SslContext sslContext = SslContextBuilder.forClient()
+                .keyManager(new File("keystore.p12"), "password") // MTLS
+                .trustManager(InsecureTrustManagerFactory.INSTANCE) // ⚠️ à remplacer par un vrai truststore
+                .build();
+
+        HttpClient httpClient = HttpClient.create().secure(t -> t.sslContext(sslContext));
+
+        return WebClient.builder()
+                .clientConnector(new ReactorClientHttpConnector(httpClient))
+                .baseUrl(backend1Url)
+                .build();
+    }
+
+    @Bean
+    public WebClient backend2Client(WebClient.Builder builder) {
+        return builder.baseUrl(backend2Url).build();
+    }
+}
